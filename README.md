@@ -42,12 +42,13 @@
 📌 Призначення виводів (Pinout):
 - Пін	 - Призначення	   - Опис
 - A3	 - iButtonPin	     - Лінія даних iButton
+- 7	   - RfidPin	       - Лінія даних Rfid
 - 10   - iBtnEmulPin	   - Емуляція iButton
 - 8	- R_Led	RGB - червоний
 - 2	- G_Led	RGB -  зелений
-- 12 - B_Led	RGB - синій
-- 6	- ACpin	- Вхід аналогового компаратора
-- 4	- speakerPin	- П'єзодинамік
+- 12 - B_Led RGB - синій
+- 6	- ACpin	- Вхід аналогового компаратора, замкнутий на gnd
+- 3	- speakerPin	- Buzzer П'єзодинамік
 - 11	- FreqGen	- Генератор 125 кГц для RFID
 - A1	- BTN_MODE	- Кнопка режиму
 - A2	- BTN_LEFT	- Кнопка "Лівий"
