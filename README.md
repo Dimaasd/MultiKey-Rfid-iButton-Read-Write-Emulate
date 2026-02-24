@@ -30,6 +30,9 @@
 
 4x18650 DIY Power Bank Shell 25W Super Fast Charging Case Dual USB Micro Type C Battery Storage Box Case Holder Without Battery
 
+![Schematic](https://github.com/user-attachments/assets/a4ab5d7a-aea8-4bfe-aa80-09d53e75a1ca)
+
+
 🔧 Апаратна частина:
 
 Мікроконтролер: Arduino Nano (ATmega328P),
