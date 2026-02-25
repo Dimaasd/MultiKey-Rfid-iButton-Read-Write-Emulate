@@ -1,5 +1,4 @@
 /*
-  Скетч к проекту "Копiювальник ключiв для домофона RFID з OLED дисплеєм та зберiганнм 42 ключiв у пам'ять EEPROM"
   Апаратна частина побудована на Arduino Nano
 */
 
@@ -20,6 +19,7 @@
 #define MAX_KEYS 42         // Максимальна кількість ключів (42 * 24 = 1008 байт)
 
 //pins
+// #define rfidPin 7      // Лiнiя data rfid
 #define iButtonPin A3      // Лiнiя data ibutton
 #define iBtnEmulPin 10     // Лiнiя емулятора ibutton
 #define Luse_Led  9        // Свiтлодiод лузи
@@ -1463,3 +1463,4 @@ void loop() {
         break;
     }
 }
+
