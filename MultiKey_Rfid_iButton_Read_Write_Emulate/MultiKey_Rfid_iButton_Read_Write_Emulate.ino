@@ -1,130 +1,399 @@
 /*
-  Апаратна частина побудована на Arduino Nano
+  Sketch for "MultiKey-Rfid-iButton-Read-Write-Emulate"
+  RFID Key Copier with OLED display and 42 keys storage in EEPROM
+  Hardware based on Arduino Nano
+  v 3.2 fix cyfral bug
+  v 3.3 added RFID output in format FF:A9:8A:A1:81:D6:5E:8C: ( id 86 key 1513154234) Type: EM-Marine
+  v 3.4 replaced encoder with three buttons control
+  v 3.5 Simplified key adding - now keys are added through array with names
+  v 3.6 Removed Luse_Led and all Serial outputs except e command for clearing
+  v 3.7 Key name displayed in 4th line, key info in EEPROM - in first line
+  v 4.0 Added iButton and RFID emulation
+  v 4.1 Added key deletion via MODE + LEFT
 */
 
-// Налаштування
+// Settings
 #include <OneWire.h>
 #include <OneWireSlave.h>
+#include <OneWireHub.h>     // Added for iButton emulation
+#include <DS2401.h>         // Added for Dallas emulation
 #include "pitches.h"
 #include <EEPROM.h>
 #include "TimerOne.h"
 #include "GyverOLED.h"
-#include <OneWireHub.h>
-#include <DS2401.h>
 
 //settings
-#define rfidUsePWD 0        // ключ використовує пароль для змiни
-#define rfidPWD 123456      // пароль для ключа
-#define rfidBitRate 2       // Швидкiсть обмiну з rfid в kbps
-#define MAX_KEYS 42         // Максимальна кількість ключів (42 * 24 = 1008 байт)
+#define rfidUsePWD 0        // key uses password for change
+#define rfidPWD 123456      // key password
+#define rfidBitRate 2       // RFID exchange speed in kbps
 
 //pins
-// #define rfidPin 7      // Лiнiя data rfid
-#define iButtonPin A3      // Лiнiя data ibutton
-#define iBtnEmulPin 10     // Лiнiя емулятора ibutton
-#define Luse_Led  9        // Свiтлодiод лузи
+#define iButtonPin A3      // ibutton data line
+#define iBtnEmulPin 10     // emulator ibutton line
 #define R_Led 8            // RGB Led
-#define G_Led 2            
-#define B_Led 12           
-#define ACpin 6            // Вхiд Ain0 аналогового компаратора
-#define speakerPin 3       // Спiкер
-#define FreqGen 11         // генератор 125 кГц
-#define BTN_MODE A1        // Кнопка режиму
-#define BTN_LEFT A2        // Кнопка "Лівий"
-#define BTN_RIGHT A0       // Кнопка "Правий"
+#define G_Led 2
+#define B_Led 12
+#define ACpin 6            // Input Ain0 of analog comparator 0.1V for EM-Marie 
+#define speakerPin 3       // Speaker, buzzer, beeper
+#define FreqGen 11         // 125 kHz generator
+#define BTN_MODE A1         // Mode switch button read/write
+#define BTN_LEFT A2         // "Left" button (previous key)
+#define BTN_RIGHT A0       // "Right" button (next key)
 
-// OneWire об'єкти
 OneWire ibutton (iButtonPin);
-OneWireSlave iBtnEmul(iBtnEmulPin);
+OneWireSlave iBtnEmul(iBtnEmulPin);       // iButton emulator for BlueMode
 
-// OneWireHub для емуляції
-auto hub = OneWireHub(iBtnEmulPin);
-DS2401* currentDS = nullptr; // Поточний віртуальний пристрій
+// ============ FOR EMULATION ============
+auto hub = OneWireHub(iBtnEmulPin);      // Main OneWire hub for iButton emulation
+DS2401* currentDS = nullptr;              // Current device for Dallas emulation
+bool emulating = false;                   // Is emulation active
+// =====================================
 
-// Структура для зберігання ключа з назвою
-struct KeyData {
-  byte id[8];
-  char name[16];  // Назва ключа (до 15 символів + нуль-термінатор)
-};
+byte maxKeyCount;                         // maximum number of keys that fit in EEPROM, but not > 42
+byte EEPROM_key_count;                    // number of keys 0..maxKeyCount stored in EEPROM
+byte EEPROM_key_index = 0;                // 1..EEPROM_key_count number of the last key written to EEPROM  
+byte addr[8];                             // temporary buffer
+byte keyID[8];                            // key ID for writing
+byte rfidData[5];                         // significant frid em-marine data
+byte halfT;                               // half period for metacom
 
-byte maxKeyCount = MAX_KEYS;               // максимальна кiлькiсть ключiв - 42
-byte EEPROM_key_count;                    // кiлькiсть ключiв 0..maxKeyCount, що зберiгаються в EEPROM
-byte EEPROM_key_index = 0;                // 1..EEPROM_key_count номер останнього записаного в EEPROM ключа  
-byte addr[8];                             // тимчасовий буфер
-KeyData currentKey;                       // поточний ключ з назвою
-byte rfidData[5];                         // значущi данi frid em-marine
-byte halfT;                               // напiвперiод для метаком
-
-// Змінні для обробки кнопок
+// Button processing variables
 unsigned long lastDebounceTime[3] = {0, 0, 0};
 unsigned long debounceDelay = 50;
 unsigned long holdTimeStart = 0;
+unsigned long comboTimeStart = 0;          // Combination start time
 bool holdMode = false;
+bool comboMode = false;                    // Combination waiting mode
 bool lastBtnState[3] = {HIGH, HIGH, HIGH};
 bool btnState[3] = {HIGH, HIGH, HIGH};
-bool modeButtonPressed = false;
-bool leftButtonPressed = false;
-bool rightButtonPressed = false;
 
-// Змінні для емуляції Dallas
-bool emulationActive = false;
-
-// ==================== 6 УНІВЕРСАЛЬНИХ КЛЮЧІВ ====================
-
-// Масив з назвами для 6 універсальних ключів
-const char* keyNames[6] = {
-  
-  "UK-3 Cyfral",
-  "Universal",
-  "Vizit 99%",
-  "Forward",
-  "Cyfral",
-  "Metakom 95%",
-  
+// ============ SIMPLIFIED KEY ADDING ============
+// Structure for storing key with name
+struct UniversalKey {
+  const char* name;        // Key name for OLED display
+  byte data[8];            // Key data
 };
 
-// Масив з 6 ключами (для початку)
-byte ReadID[6][8] = {
-  {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3D}, // 5  - UK-3 Cyfral
-  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x2F}, // 6  - Стандартний універсальний
-  {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x00, 0x6F}, // 17 - Vizit 99%
-  {0x01, 0x76, 0xB8, 0x2E, 0x0F, 0x00, 0x00, 0x5C}, // 19 - Форвард
-  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x14}, // 11 - Открываает 98% Metakom и некоторые Cyfral
-  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xA0}  // 14 - Metakom 95%
-  
-//  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0xFF, 0x00}, // - 1 Univer 1F
-//  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x2F, 0xFF, 0x00}, // - 2 Univer 2F
-//  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x9B}, // - 3 UK-1 Metakom 2003
-//  {0x01, 0xBE, 0x40, 0x11, 0x5A, 0x36, 0x00, 0xE1}, // - 4 UK-2 Vizit – код универсального ключа, для Vizit 
-//  {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3D}, // - 5 UK-3 Cyfral----------------------------------------------------1
-//  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x2F}, // - 6 Стандартный универсальный ключ --------------------------------2
-//  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00}, // - 7 Обычный
-//  {0x01, 0x00, 0x00, 0x00, 0x00, 0x90, 0x19, 0xFF}, // - 8 Отлично работает на старых домофонах
-//  {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x7E, 0x88}, // - 9 Cyfral, Metakom
-//  {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x7E, 0x00}, // - 10 Cyfral,Metakom
-//  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x14}, // - 11 Открываает 98% Metakom и некоторые Cyfral
-//  {0x01, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00}, // - 12 домофоны Cyfral + фильтр и защита
-//  {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00}, // - 13 Metakom
-//  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xA0}, // - 14 Metakom 95%
-//  {0x01, 0x00, 0xBE, 0x11, 0xAA, 0x00, 0x00, 0xFB}, // - 15 домофоны KeyMan
-//  {0x01, 0xBE, 0x40, 0x11, 0x0A, 0x00, 0x00, 0x1D}, // - 16 проверен работает Vizit иногда KeyMan
-//  {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x00, 0x6F}, // - 17 домофоны Vizit - до 99%---------------------------------------3
-//  {0x01, 0xBE, 0x40, 0x11, 0x5A, 0x36, 0x00, 0x00}, // - 18 Vizit 99%
-//  {0x01, 0x76, 0xB8, 0x2E, 0x0F, 0x00, 0x00, 0x5C}, // - 19 домофоны Форвард----------------------------------------------4
-//  {0x01, 0xA9, 0xE4, 0x3C, 0x09, 0x00, 0x00, 0x00}, // - 20 домофоны Eltis - до 90%
-//  {0x01, 0xBE, 0x40, 0x11, 0x5A, 0x56, 0x00, 0xBB}, // - 21 проверен работает 
-//  {0x01, 0xBE, 0x40, 0x11, 0x00, 0x00, 0x00, 0x77}, // - 22 проверен работает 
+  // Array of universal keys with names
+UniversalKey universalKeys[] = {
+  // Dallas/Metakom/Cyfral keys (start with 0x01)
+  {"Univer 1F",              {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0xFF, 0x00}}, // - 1 Univer 1F
+  {"Univer 2F",              {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x2F, 0xFF, 0x00}}, // - 2 Univer 2F
+//  {"UK-1 Metakom 2003",      {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x9B}}, // - 3 UK-1 Metakom 2003
+//  {"UK-2 Vizit",             {0x01, 0xBE, 0x40, 0x11, 0x5A, 0x36, 0x00, 0xE1}}, // - 4 UK-2 Vizit
+//  {"UK-3 Cyfral",            {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3D}}, // - 5 UK-3 Cyfral
+//  {"Standard Universal",     {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x2F}}, // - 6 Standard universal key
+//  {"Ordinary",               {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00}}, // - 7 Ordinary
+//  {"Old Door Work",          {0x01, 0x00, 0x00, 0x00, 0x00, 0x90, 0x19, 0xFF}}, // - 8 Works great on old intercoms
+//  {"Cyfral Metakom 1",       {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x7E, 0x88}}, // - 9 Cyfral, Metakom
+//  {"Cyfral Metakom 2",       {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x7E, 0x00}}, // - 10 Cyfral, Metakom
+  {"Metakom 98%",            {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x14}}, // - 11 Opens 98% Metakom and some Cyfral
+//  {"Cyfral Filter",          {0x01, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00}}, // - 12 Cyfral intercoms + filter and protection
+//  {"Metakom",                {0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00}}, // - 13 Metakom
+  {"Metakom 95%",            {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xA0}}, // - 14 Metakom 95%
+//  {"KeyMan",                 {0x01, 0x00, 0xBE, 0x11, 0xAA, 0x00, 0x00, 0xFB}}, // - 15 KeyMan intercoms
+//  {"Vizit KeyMan",           {0x01, 0xBE, 0x40, 0x11, 0x0A, 0x00, 0x00, 0x1D}}, // - 16 tested works Vizit sometimes KeyMan
+//  {"Vizit 99%",              {0x01, 0x53, 0xD4, 0xFE, 0x00, 0x00, 0x00, 0x6F}}, // - 17 Vizit intercoms - up to 99%
+//  {"Vizit 99% Plus",         {0x01, 0xBE, 0x40, 0x11, 0x5A, 0x36, 0x00, 0x00}}, // - 18 Vizit 99%
+//  {"Forward",                {0x01, 0x76, 0xB8, 0x2E, 0x0F, 0x00, 0x00, 0x5C}}, // - 19 Forward intercoms
+//  {"Eltis 90%",              {0x01, 0xA9, 0xE4, 0x3C, 0x09, 0x00, 0x00, 0x00}}, // - 20 Eltis intercoms - up to 90%
+//  {"Vizit Tested 1",         {0x01, 0xBE, 0x40, 0x11, 0x5A, 0x56, 0x00, 0xBB}}, // - 21 tested works
+//  {"Vizit Tested 2",         {0x01, 0xBE, 0x40, 0x11, 0x00, 0x00, 0x00, 0x77}}, // - 22 tested works
+  {"Metakom 22",             {0x01, 0xAA, 0x69, 0xC9, 0x36, 0x00, 0x00, 0xE9}}, // Your original Metakom key
+//  {"EM-Marine 76",           {0xFF, 0xA9, 0x8A, 0xB8, 0x13, 0x14, 0x8F, 0xB4}}, // - EM-Marine 76
+//  {"EM-Marine 42a",          {0xFF, 0xA9, 0x8A, 0xA7, 0x65, 0xBC, 0x16, 0xE6}}, // - EM-Marine 42a
+//  {"EM-Marine 42b",          {0xFF, 0xA9, 0x8A, 0xA7, 0x65, 0xB9, 0x3D, 0x9C}}, // - EM-Marine 42b
+  {"Garage EM-Marine",       {0xFF, 0x94, 0x60, 0x05, 0xF7, 0xBF, 0x5D, 0x30}}  // Your original Garage EM-Marine key
 };
 
-enum emRWType {rwUnknown, TM01, RW1990_1, RW1990_2, TM2004, T5557, EM4305};               // тип заготовки
-enum emkeyType {keyUnknown, keyDallas, keyTM2004, keyCyfral, keyMetacom, keyEM_Marine};    // тип оригiнального ключа  
+// Number of keys in array
+const int UNIVERSAL_KEYS_COUNT = sizeof(universalKeys) / sizeof(UniversalKey);
+// ==================================================
+
+enum emRWType {rwUnknown, TM01, RW1990_1, RW1990_2, TM2004, T5557, EM4305};               // blank type
+enum emkeyType {keyUnknown, keyDallas, keyTM2004, keyCyfral, keyMetacom, keyEM_Marine};    // original key type  
 emkeyType keyType;
-enum emMode {md_empty, md_read, md_write, md_blueMode};               // режим роботи копiювальника
+enum emMode {md_empty, md_read, md_write, md_blueMode};               // copier operating mode
 emMode copierMode = md_empty;
 
-GyverOLED<SSD1306_128x32, OLED_NO_BUFFER> oled;
+GyverOLED<SSD1306_128x32, OLED_NO_BUFFER> oled; // Using without buffer
 
-// CRC8 для iButton
+//***************** sounds ****************
+void Sd_StartOK() {   // sound "Successful startup"
+  tone(speakerPin, NOTE_A7); delay(100);
+  tone(speakerPin, NOTE_G7); delay(100);
+  tone(speakerPin, NOTE_E7); delay(100); 
+  tone(speakerPin, NOTE_C7); delay(100);  
+  tone(speakerPin, NOTE_D7); delay(100); 
+  tone(speakerPin, NOTE_B7); delay(100); 
+  tone(speakerPin, NOTE_F7); delay(100); 
+  tone(speakerPin, NOTE_C7); delay(100);
+  noTone(speakerPin); 
+}
+
+void Sd_ReadOK() {  // sound OK
+  for (int i=400; i<6000; i=i*1.5) { tone(speakerPin, i); delay(20); }
+  noTone(speakerPin);
+}
+
+void Sd_WriteStep(){  // sound "next step"
+  for (int i=2500; i<6000; i=i*1.5) { tone(speakerPin, i); delay(10); }
+  noTone(speakerPin);
+}
+
+void Sd_ErrorBeep() {  // sound "ERROR"
+  for (int j=0; j <3; j++){
+    for (int i=1000; i<2000; i=i*1.1) { tone(speakerPin, i); delay(10); }
+    delay(50);
+    for (int i=1000; i>500; i=i*1.9) { tone(speakerPin, i); delay(10); }
+    delay(50);
+  }
+  noTone(speakerPin);
+}
+
+void Sd_DeleteOK() {  // sound "Deletion successful"
+  tone(speakerPin, NOTE_C7); delay(100);
+  tone(speakerPin, NOTE_E7); delay(100);
+  tone(speakerPin, NOTE_G7); delay(100);
+  tone(speakerPin, NOTE_C8); delay(200);
+  noTone(speakerPin);
+}
+
+void Sd_ComboStart() { // sound "Combination activated"
+  tone(speakerPin, NOTE_C7); delay(50);
+  tone(speakerPin, NOTE_E7); delay(50);
+  tone(speakerPin, NOTE_G7); delay(50);
+  noTone(speakerPin);
+}
+
+// Function to get key name (if exists)
+String getKeyName(byte buf[8]) {
+  for (int i = 0; i < UNIVERSAL_KEYS_COUNT; i++) {
+    bool match = true;
+    for (int j = 0; j < 8; j++) {
+      if (universalKeys[i].data[j] != buf[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return String(universalKeys[i].name);
+    }
+  }
+  return "";
+}
+
+// Function for displaying RFID information - 4 lines
+void OLED_printRFIDInfo(byte buf[8], byte msgType = 0) {
+  oled.clear();
+  oled.home();
+  
+  // First line - key info in EEPROM
+  String st1 = "";
+  switch (msgType){
+    case 0: st1 = "Key " + String(EEPROM_key_index) + " of " + String(EEPROM_key_count) + " in Memory"; break;      
+    case 1: st1 = "Hold to save";  break; 
+    case 3: st1 = "Key " + String(indxKeyInROM(buf)) + " exists in Memory";  break;
+    case 4: st1 = "Delete key?"; break;
+    case 5: st1 = "Key deleted!"; break;
+  }
+  oled.println(st1);
+  
+  // Second line - HEX values with colon
+  String st2 = "";
+  for (byte i = 0; i < 8; i++) {
+    if (buf[i] < 0x10) st2 += "0";
+    st2 += String(buf[i], HEX);
+    if (i < 7) st2 += "";
+  }
+  oled.println(st2);
+  
+  // Third line - id and key
+  String st3 = "";
+  if (vertEvenCheck(buf)) {
+    unsigned long keyNum = (unsigned long)rfidData[1]<<24 | (unsigned long)rfidData[2]<<16 | 
+                           (unsigned long)rfidData[3]<<8 | (unsigned long)rfidData[4];
+    st3 = "id " + String(rfidData[0]) + " key " + String(keyNum);
+  } else {
+    st3 = "(id ? key ?)";
+  }
+  oled.println(st3);
+  
+  // Fourth line - key name (if exists) or key type
+  String st4 = "";
+  String keyName = getKeyName(buf);
+  if (keyName.length() > 0) {
+    st4 = keyName;
+  } else {
+    st4 = "Type: ";
+    switch (keyType){
+      case keyDallas: st4 += "Dallas"; break;      
+      case keyCyfral: st4 += "Cyfral"; break;  
+      case keyMetacom: st4 += "Metakom"; break;             
+      case keyEM_Marine: st4 += "EM-Marine"; break;
+      case keyTM2004: st4 += "TM2004"; break;
+      case keyUnknown: st4 += "Unknown"; break;
+    }
+  }
+  oled.println(st4);
+  
+  oled.update();
+}
+
+// Function for displaying regular keys - 4 lines
+void OLED_printKey(byte buf[8], byte msgType = 0){
+  // For RFID keys use special format
+  if (keyType == keyEM_Marine) {
+    OLED_printRFIDInfo(buf, msgType);
+    return;
+  }
+  
+  oled.clear();
+  oled.home();
+  
+  // First line - key info in EEPROM
+  String st1 = "";
+  switch (msgType){
+    case 0: st1 = "Key " + String(EEPROM_key_index) + " of " + String(EEPROM_key_count) + " in Memory"; break;      
+    case 1: st1 = "Hold to save";  break; 
+    case 3: st1 = "Key " + String(indxKeyInROM(buf)) + " exists in Memory";  break;
+    case 4: st1 = "Delete key?"; break;
+    case 5: st1 = "Key deleted!"; break;
+  }
+  oled.println(st1);
+  
+  // Second line - HEX values with colon
+  String st2 = "";
+  for (byte i = 0; i < 8; i++) {
+    if (buf[i] < 0x10) st2 += "0";
+    st2 += String(buf[i], HEX);
+    if (i < 7) st2 += "";
+  }
+  oled.println(st2);
+  
+  // Third line - empty (for alignment) or key type
+  String st3 = "";
+  st3 = "Type: ";
+  switch (keyType){
+    case keyDallas: st3 += "Dallas"; break;      
+    case keyCyfral: st3 += "Cyfral"; break;  
+    case keyMetacom: st3 += "Metakom"; break;             
+    case keyTM2004: st3 += "TM2004"; break;
+    case keyUnknown: st3 += "Unknown"; break;
+  }
+  oled.println(st3);
+  
+  // Fourth line - key name (if exists)
+  String st4 = getKeyName(buf);
+  oled.println(st4);
+  
+  oled.update();
+}
+
+void OLED_printError(String st, bool err = true){
+  oled.clear();
+  oled.home();
+  if (err) oled.println("Error!");
+    else oled.println("OK");
+  oled.println(st);  
+  oled.update();
+}
+
+// Function to add all universal keys
+void addAllUniversalKeys() {
+  for (int i = 0; i < UNIVERSAL_KEYS_COUNT; i++) {
+    if (EPPROM_AddKey(universalKeys[i].data)) {
+      oled.clear();
+      oled.home();
+      oled.println("Key added:");
+      oled.println(String(universalKeys[i].name));
+      oled.update();
+      Sd_ReadOK();
+      delay(1000);
+    }
+  }
+}
+
+// ============ KEY DELETION FUNCTION ============
+void deleteCurrentKey() {
+  if (EEPROM_key_count == 0) {
+    OLED_printError("No keys");
+    Sd_ErrorBeep();
+    delay(1000);
+    return;
+  }
+  
+  // Show confirmation
+  OLED_printKey(keyID, 4);
+  
+  // Wait 2 seconds for confirmation
+  unsigned long confirmStart = millis();
+  bool confirmed = false;
+  
+  while (millis() - confirmStart < 2000) {
+    // If MODE button pressed again - confirm deletion
+    if (digitalRead(BTN_MODE) == LOW) {
+      delay(50);
+      if (digitalRead(BTN_MODE) == LOW) {
+        confirmed = true;
+        break;
+      }
+    }
+    delay(10);
+  }
+  
+  if (confirmed) {
+    // Delete current key
+    byte buf1[8];
+    
+    // Shift all keys after current one back by one position
+    for (byte j = EEPROM_key_index; j < EEPROM_key_count; j++) {
+      EEPROM.get((j + 1) * sizeof(buf1), buf1);
+      EEPROM.put(j * sizeof(buf1), buf1);
+    }
+    
+    // Decrease key counter
+    EEPROM_key_count--;
+    EEPROM.update(0, EEPROM_key_count);
+    
+    // Adjust index
+    if (EEPROM_key_index > EEPROM_key_count) {
+      EEPROM_key_index = EEPROM_key_count;
+    }
+    if (EEPROM_key_index < 1 && EEPROM_key_count > 0) {
+      EEPROM_key_index = 1;
+    }
+    EEPROM.update(1, EEPROM_key_index);
+    
+    // Update current key
+    if (EEPROM_key_count > 0) {
+      EEPROM_get_key(EEPROM_key_index, keyID);
+    }
+    
+    // Show result
+    OLED_printKey(keyID, 5);
+    Sd_DeleteOK();
+    delay(1500);
+    
+    // Return to normal display
+    if (EEPROM_key_count > 0) {
+      OLED_printKey(keyID);
+    } else {
+      oled.clear();
+      oled.home();
+      oled.println("Memory empty");
+      oled.update();
+    }
+  } else {
+    // Cancel deletion
+    OLED_printKey(keyID);
+  }
+}
+// ==================================================
+
+// ============ EMULATION FUNCTIONS ============
+
+// CRC8 for iButton
 uint8_t onewire_crc8(const uint8_t *addr, uint8_t len) {
   uint8_t crc = 0;
   while (len--) {
@@ -139,304 +408,44 @@ uint8_t onewire_crc8(const uint8_t *addr, uint8_t len) {
   return crc;
 }
 
-// Проста функцiя для використання латинських букв замiсть українських
-String latinText(String input) {
-  String result = "";
-  for (unsigned int i = 0; i < input.length(); i++) {
-    char c = input[i];
-    if (c == 'і' || c == 'І') result += 'i';
-    else if (c == 'ї' || c == 'Ї') result += 'i';
-    else if (c == 'є' || c == 'Є') result += 'e';
-    else if (c == 'ґ' || c == 'Ґ') result += 'g';
-    else result += c;
-  }
-  return result;
-}
-
-//***************** звуки ****************
-void Sd_StartOK() {
-  tone(speakerPin, NOTE_A7); delay(100);
-  tone(speakerPin, NOTE_G7); delay(100);
-  tone(speakerPin, NOTE_E7); delay(100); 
-  tone(speakerPin, NOTE_C7); delay(100);  
-  tone(speakerPin, NOTE_D7); delay(100); 
-  tone(speakerPin, NOTE_B7); delay(100); 
-  tone(speakerPin, NOTE_F7); delay(100); 
-  tone(speakerPin, NOTE_C7); delay(100);
-  noTone(speakerPin); 
-}
-
-void Sd_ReadOK() {
-  for (int i=400; i<6000; i=i*1.5) { tone(speakerPin, i); delay(20); }
-  noTone(speakerPin);
-}
-
-void Sd_WriteStep(){
-  for (int i=2500; i<6000; i=i*1.5) { tone(speakerPin, i); delay(10); }
-  noTone(speakerPin);
-}
-
-void Sd_ErrorBeep() {
-  for (int j=0; j <3; j++){
-    for (int i=1000; i<2000; i=i*1.1) { tone(speakerPin, i); delay(10); }
-    delay(50);
-    for (int i=1000; i>500; i=i*1.9) { tone(speakerPin, i); delay(10); }
-    delay(50);
-  }
-  noTone(speakerPin);
-}
-
-void Sd_DeleteOK() {
-  tone(speakerPin, NOTE_C6); delay(100);
-  tone(speakerPin, NOTE_G5); delay(100);
-  tone(speakerPin, NOTE_E5); delay(100);
-  noTone(speakerPin);
-}
-
-void Sd_EmulationStart() {
-  tone(speakerPin, NOTE_C6); delay(50);
-  tone(speakerPin, NOTE_E6); delay(50);
-  tone(speakerPin, NOTE_G6); delay(50);
-  tone(speakerPin, NOTE_C7); delay(50);
-  noTone(speakerPin);
-}
-
-// Функція для отримання назви ключа за його ID
-String getKeyName(byte buf[8]) {
-  // Спочатку перевіряємо в 9 універсальних ключах
-  for (int i = 0; i < 6; i++) {
-    if (memcmp(buf, ReadID[i], 8) == 0) {
-      return String(keyNames[i]);
-    }
-  }
-  
-  // Якщо ключ збережений в EEPROM, перевіряємо чи є в нього назва
-  if (currentKey.name[0] != '\0') {
-    return String(currentKey.name);
-  }
-  
-  // Якщо назви немає, повертаємо "Key X"
-  return "Key " + String(EEPROM_key_index);
-}
-
-// Функцiя для виведення RFID iнформацiї
-void OLED_printRFIDInfo(byte buf[8], byte msgType = 0) {
-  oled.clear();
-  oled.home();
-  
-  String st;
-  switch (msgType){
-    case 0: st = "KEY " + String(EEPROM_key_index) + "/" + String(EEPROM_key_count); break;      
-    case 1: st = "Hold to save";  break; 
-    case 2: st = "Hold to DELETE"; break;
-    case 3: st = "Key " + String(indxKeyInROM(buf)) + " in ROM";  break;   
-    case 4: st = "--EMULATION MODE--"; break;
-  }
-  oled.println(latinText(st));
-  
-  String hexStr = "";
-  for (byte i = 0; i < 8; i++) {
-    if (buf[i] < 0x10) hexStr += "0";
-    hexStr += String(buf[i], HEX);
-    if (i < 7) hexStr += "";
-  }
-  hexStr += ":";
-  oled.println(hexStr);
-  
-  unsigned long keyNum = 0;
-  byte idValue = 0;
-  
-  if (vertEvenCheck(buf)) {
-    idValue = rfidData[0];
-    keyNum = (unsigned long)rfidData[1]<<24 | (unsigned long)rfidData[2]<<16 | 
-             (unsigned long)rfidData[3]<<8 | (unsigned long)rfidData[4];
-    
-    String infoStr = "id " + String(idValue) + " key " + String(keyNum);
-    oled.println(infoStr);
-  } else {
-    oled.println("(id ? key ?)");
-  }
-  
-  String nameStr = getKeyName(buf);
-  oled.println(latinText(nameStr));
-  
-  oled.update();
-}
-
-void OLED_printKey(byte buf[8], byte msgType = 0){
-  if (keyType == keyEM_Marine) {
-    OLED_printRFIDInfo(buf, msgType);
-    return;
-  }
-  
-  oled.clear();
-  oled.home();
-  
-  String st;
-  switch (msgType){
-    case 0: st = "Key " + String(EEPROM_key_index) + "/" + String(EEPROM_key_count); break;      
-    case 1: st = "Hold to save";  break; 
-    case 2: st = "Hold to DELETE"; break;
-    case 3: st = "Key " + String(indxKeyInROM(buf)) + " in ROM";  break;   
-    case 4: st = "--EMULATION MODE--"; break;
-  }
-  oled.println(latinText(st));
-  
-  st = "";
-  for (byte i = 0; i < 8; i++) {
-    if (buf[i] < 0x10) st += "0";
-    st += String(buf[i], HEX) + "";
-  }
-  oled.println(st);
-  
-  st = "Type: ";
-  switch (keyType){
-    case keyDallas: st += "Dallas"; break;      
-    case keyCyfral: st += "Cyfral";  break;  
-    case keyMetacom: st += "Metakom"; break;             
-    case keyEM_Marine: st += "EM-Marine"; break;
-    case keyTM2004: st += "TM2004"; break;
-    case keyUnknown: st += "Unknown"; break;
-  }
-  oled.println(latinText(st));
-  
-  String nameStr = getKeyName(buf);
-  oled.println(latinText(nameStr));
-  
-  oled.update();
-}
-
-void OLED_printError(String st, bool err = true){
-  oled.clear();
-  oled.home();
-  if (err) oled.println(latinText("Error!"));
-    else oled.println("OK");
-  oled.println(latinText(st));  
-  oled.update();
-}
-
-// ==================== ВИДАЛЕННЯ КЛЮЧА ====================
-void deleteCurrentKey() {
-  if (EEPROM_key_count == 0) {
-    OLED_printError("No keys to delete");
-    Sd_ErrorBeep();
-    delay(1000);
-    return;
-  }
-  
-  // Показуємо підтвердження
-  oled.clear();
-  oled.home();
-  oled.println("DELETE KEY?");
-  oled.println(String(EEPROM_key_index) + "/" + String(EEPROM_key_count));
-  oled.println("Hold MODE to confirm");
-  oled.update();
-  
-  // Чекаємо підтвердження (ще 1 секунду)
-  unsigned long confirmStart = millis();
-  bool confirmed = false;
-  
-  while (millis() - confirmStart < 1000) {
-    if (digitalRead(BTN_MODE) == LOW) {
-      confirmed = true;
-      break;
-    }
-    delay(50);
-  }
-  
-  if (!confirmed) {
-    OLED_printKey(currentKey.id);
-    return;
-  }
-  
-  // Видаляємо ключ
-  if (EEPROM_key_count == 1) {
-    // Якщо це останній ключ
-    EEPROM_key_count = 0;
-    EEPROM_key_index = 0;
-    EEPROM.update(0, 0);
-    EEPROM.update(1, 0);
-    
-    oled.clear();
-    oled.home();
-    oled.println("All keys deleted");
-    oled.update();
-    Sd_DeleteOK();
-    delay(1000);
-    
-    copierMode = md_empty;
-    clearLed();
-    
-  } else {
-    // Зсуваємо всі ключі після видаленого
-    for (byte i = EEPROM_key_index; i < EEPROM_key_count; i++) {
-      KeyData nextKey;
-      EEPROM.get((i + 1) * sizeof(KeyData), nextKey);
-      EEPROM.put(i * sizeof(KeyData), nextKey);
-    }
-    
-    EEPROM_key_count--;
-    if (EEPROM_key_index > EEPROM_key_count) EEPROM_key_index = EEPROM_key_count;
-    
-    EEPROM.update(0, EEPROM_key_count);
-    EEPROM.update(1, EEPROM_key_index);
-    
-    // Завантажуємо поточний ключ
-    EEPROM_get_key(EEPROM_key_index, currentKey.id);
-    
-    oled.clear();
-    oled.home();
-    oled.println("Key deleted");
-    oled.update();
-    Sd_DeleteOK();
-    delay(1000);
-  }
-  
-  // Показуємо поточний ключ
-  if (EEPROM_key_count > 0) {
-    OLED_printKey(currentKey.id);
-    digitalWrite(G_Led, HIGH);
-  } else {
-    oled.clear();
-    oled.home();
-    oled.println("No keys in ROM");
-    oled.update();
-  }
-}
-
-// ==================== ЕМУЛЯЦІЯ DALLAS ====================
-void startDallasEmulation(byte* keyData) {
-  // Зупиняємо попередню емуляцію якщо була
+// Start iButton emulation (Dallas, Cyfral, Metakom)
+void startIButtonEmulation() {
+  // Remove previous device if existed
   if (currentDS != nullptr) {
     hub.detach(*currentDS);
     delete currentDS;
     currentDS = nullptr;
   }
   
-  // Виправляємо CRC
+  // Fix CRC for Dallas keys
   byte emulKey[8];
-  memcpy(emulKey, keyData, 8);
+  memcpy(emulKey, keyID, 8);
   
-  if (keyType == keyDallas || keyType == keyTM2004 || keyType == keyMetacom || keyType == keyCyfral) {
+  if (keyType == keyDallas || keyType == keyTM2004) { // Dallas key
     emulKey[7] = onewire_crc8(emulKey, 7);
   }
   
-  // Створюємо віртуальний пристрій
-  currentDS = new DS2401(emulKey[0], emulKey[1], emulKey[2], emulKey[3],
+  // For Cyfral and Metakom - emulate as Dallas with correct first byte
+  if (keyType == keyCyfral) {
+    emulKey[0] = 0x01; // Pretend it's Dallas
+    emulKey[7] = onewire_crc8(emulKey, 7);
+  }
+  if (keyType == keyMetacom) {
+    emulKey[0] = 0x01; // Pretend it's Dallas
+    emulKey[7] = onewire_crc8(emulKey, 7);
+  }
+  
+  // Create new device
+  currentDS = new DS2401(emulKey[0], emulKey[1], emulKey[2], emulKey[3], 
                          emulKey[4], emulKey[5], emulKey[6]);
   
-  hub.attach(*currentDS);
+  hub.attach(*currentDS);  // Connect to hub
   
-  emulationActive = true;
-  digitalWrite(B_Led, HIGH);
-  
-  // Видалено Serial.println(F("Dallas emulation started"));
-  Sd_EmulationStart();
-  
-  // Показуємо на екрані
+  // Show on display
   oled.clear();
   oled.home();
-  oled.println(">>> EMULATING <<<");
+  oled.println(">> iButton Emulation <");
+  oled.println("Key:");
   
   char buf[20];
   sprintf(buf, "%02X %02X %02X %02X", emulKey[0], emulKey[1], emulKey[2], emulKey[3]);
@@ -445,71 +454,196 @@ void startDallasEmulation(byte* keyData) {
   oled.println(buf);
   oled.println("MODE=stop");
   oled.update();
+  
+  emulating = true;
+  digitalWrite(B_Led, HIGH); // Blue LED - emulation mode
 }
 
-void stopDallasEmulation() {
-  emulationActive = false;
+// Start RFID emulation (EM-Marine)
+void startRFIDEmulation() {
+  // Show on display
+  oled.clear();
+  oled.home();
+  oled.println(">>  RFID Emulation  <<");
+  oled.println("Key:");
   
+  char buf[20];
+  sprintf(buf, "%02X %02X %02X %02X", keyID[0], keyID[1], keyID[2], keyID[3]);
+  oled.println(buf);
+  sprintf(buf, "%02X %02X %02X %02X", keyID[4], keyID[5], keyID[6], keyID[7]);
+  oled.println(buf);
+  
+  if (vertEvenCheck(keyID)) {
+    oled.println("id " + String(rfidData[0]) + " key " + String((unsigned long)rfidData[1]<<24 | (unsigned long)rfidData[2]<<16 | (unsigned long)rfidData[3]<<8 | (unsigned long)rfidData[4]));
+  }
+  oled.println("MODE=stop");
+  oled.update();
+  
+  emulating = true;
+  digitalWrite(B_Led, HIGH); // Blue LED - emulation mode
+}
+
+// Send RFID key (EM-Marine emulation)
+void sendRFIDKey(byte* buf) {
+  // Turn on 125kHz generator
+  rfidACsetOn();
+  
+  // Configure timer for modulation
+  TCCR2A &=0b00111111; // disable PWM for modulation
+  digitalWrite(FreqGen, LOW);
+  delay(20);
+  
+  // Send key 10 times (like typical RFID transponder)
+  for (byte k = 0; k < 10; k++) {
+    for (byte i = 0; i < 8; i++) {
+      for (byte j = 0; j < 8; j++) {
+        if (1 & (buf[i] >> (7 - j))) {
+          // Bit 1 - modulation (short field off)
+          pinMode(FreqGen, INPUT);
+          delayMicroseconds(250);
+          pinMode(FreqGen, OUTPUT);
+          delayMicroseconds(250);
+        } else {
+          // Bit 0 - no modulation
+          pinMode(FreqGen, OUTPUT);
+          delayMicroseconds(250);
+          pinMode(FreqGen, INPUT);
+          delayMicroseconds(250);
+        }
+      }
+    }
+  }
+  
+  // Turn off generator
+  TCCR2A &=0b00111111;
+}
+
+// Stop emulation
+void stopEmulation() {
+  emulating = false;
+  
+  // Stop iButton emulation if it was active
   if (currentDS != nullptr) {
     hub.detach(*currentDS);
     delete currentDS;
     currentDS = nullptr;
   }
   
+  // Turn off RFID generator
+  TCCR2A &=0b00111111;
+  
+  oled.clear();
+  oled.home();
+  oled.println(">>>  STOPPED  <<<");
+  oled.update();
+  delay(500);
+  
+  OLED_printKey(keyID);
   digitalWrite(B_Led, LOW);
-  // Видалено Serial.println(F("Dallas emulation stopped"));
 }
 
-// ==================== РОБОТА З EEPROM ====================
+// ========================================
+
+void setup() {
+  // Button pins setup
+  pinMode(BTN_MODE, INPUT_PULLUP);
+  pinMode(BTN_LEFT, INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT_PULLUP);
+  
+  oled.init(); // Display initialization
+  oled.setScale(1); // Set text scale
+  pinMode(speakerPin, OUTPUT);
+  pinMode(ACpin, INPUT);
+  pinMode(R_Led, OUTPUT); pinMode(G_Led, OUTPUT); pinMode(B_Led, OUTPUT);
+  clearLed();
+  pinMode(FreqGen, OUTPUT);                               
+  Serial.begin(115200);
+  
+  oled.clear();
+  oled.home();
+  oled.println("MultiKey------Rfid");
+  oled.println("-----------iButton");
+  oled.println("------------------");
+  oled.println("Read Write Emulate");
+  oled.update();
+  
+  Sd_StartOK();
+  EEPROM_key_count = EEPROM[0];
+  maxKeyCount = EEPROM.length() / 8 - 1; if (maxKeyCount > 42) maxKeyCount = 42;
+  
+  if (EEPROM_key_count > maxKeyCount) EEPROM_key_count = 0;
+  if (EEPROM_key_count != 0 ) {
+    EEPROM_key_index = EEPROM[1];
+    EEPROM_get_key(EEPROM_key_index, keyID);
+    delay(3000);
+    OLED_printKey(keyID);
+    copierMode = md_read;
+    digitalWrite(G_Led, HIGH);
+  } else {
+    oled.clear();
+    oled.home();
+    oled.println("No keys in Memory yet");
+    oled.update();  
+  }
+
+  Timer1.initialize(1000);
+  Timer1.attachInterrupt(timerIsr);
+  
+  // Adding all universal keys with one call
+  addAllUniversalKeys();
+}
+
+void timerIsr() {
+  // Timer used for other purposes
+}
+
+void clearLed(){
+  digitalWrite(R_Led, LOW);
+  digitalWrite(G_Led, LOW);
+  digitalWrite(B_Led, LOW);  
+}
+
 byte indxKeyInROM(byte buf[]){
-  KeyData keyBuf; bool eq = true;
-  for (byte j = 1; j <= EEPROM_key_count; j++){
-    EEPROM.get(j * sizeof(KeyData), keyBuf);
-    eq = true;
+  byte buf1[8]; bool eq = true;
+  for (byte j = 1; j<=EEPROM_key_count; j++){
+    EEPROM.get(j*sizeof(buf1), buf1);
     for (byte i = 0; i < 8; i++) 
-      if (keyBuf.id[i] != buf[i]) { eq = false; break; }
+      if (buf1[i] != buf[i]) { eq = false; break;}
     if (eq) return j;
+    eq = true;
   }
   return 0;
 }
 
-bool EPPROM_AddKey(KeyData key){
-  byte indx = indxKeyInROM(key.id);
-  if (indx != 0) { 
+bool EPPROM_AddKey(byte buf[]){
+  byte buf1[8]; byte indx;
+  indx = indxKeyInROM(buf);
+  if ( indx != 0) { 
     EEPROM_key_index = indx;
     EEPROM.update(1, EEPROM_key_index);
     return false; 
   }
+  if (EEPROM_key_count <= maxKeyCount) EEPROM_key_count++;
+  if (EEPROM_key_count < maxKeyCount) EEPROM_key_index = EEPROM_key_count;
+    else EEPROM_key_index++;
+  if (EEPROM_key_index > EEPROM_key_count) EEPROM_key_index = 1;
   
-  if (EEPROM_key_count < maxKeyCount) {
-    EEPROM_key_count++;
-    EEPROM_key_index = EEPROM_key_count;
-  } else {
-    EEPROM_key_index++;
-    if (EEPROM_key_index > maxKeyCount) EEPROM_key_index = 1;
+  for (byte i = 0; i < 8; i++) {
+    buf1[i] = buf[i];
   }
-  
-  // Видалено Serial.println(F("Adding to ROM"));
-  // for (byte i = 0; i < 8; i++) {
-  //   Serial.print(key.id[i], HEX); Serial.print(F(":"));  
-  // }
-  // Serial.print(F(" Name: "));
-  // Serial.println(key.name);
-  
-  EEPROM.put(EEPROM_key_index * sizeof(KeyData), key);
+  EEPROM.put(EEPROM_key_index*sizeof(buf1), buf1);
   EEPROM.update(0, EEPROM_key_count);
   EEPROM.update(1, EEPROM_key_index);
   return true;
 }
 
 void EEPROM_get_key(byte EEPROM_key_index1, byte buf[8]){
-  KeyData keyBuf;
-  int address = EEPROM_key_index1 * sizeof(KeyData);
-  if (address + sizeof(KeyData) > EEPROM.length()) return;
-  EEPROM.get(address, keyBuf);
-  for (byte i = 0; i < 8; i++) buf[i] = keyBuf.id[i];
-  strcpy(currentKey.name, keyBuf.name);
-  keyType = getKeyType(keyBuf.id);
+  byte buf1[8];
+  int address = EEPROM_key_index1*sizeof(buf1);
+  if (address > EEPROM.length()) return;
+  EEPROM.get(address, buf1);
+  for (byte i = 0; i < 8; i++) buf[i] = buf1[i];
+  keyType = getKeyType(buf1);
 }
 
 emkeyType getKeyType(byte* buf){
@@ -520,7 +654,7 @@ emkeyType getKeyType(byte* buf){
   return keyUnknown;
 }
 
-// Функція для читання стану кнопки з антидребезгом
+// Function for reading button state with debounce
 bool readButton(int pin, int btnIndex) {
   bool reading = digitalRead(pin);
   
@@ -535,10 +669,10 @@ bool readButton(int pin, int btnIndex) {
   }
   
   lastBtnState[btnIndex] = reading;
-  return btnState[btnIndex] == LOW;
+  return btnState[btnIndex];
 }
 
-//*************** Dallas **************
+//*************** dallas **************
 emRWType getRWtype(){    
    byte answer;
   ibutton.reset(); ibutton.write(0xD1);
@@ -547,7 +681,6 @@ emRWType getRWtype(){
   ibutton.reset(); ibutton.write(0xB5);
   answer = ibutton.read();
   if (answer == 0xFE){
-    // Видалено Serial.println(F(" Type: dallas RW-1990.1 "));
     return RW1990_1;
   }
   
@@ -560,7 +693,6 @@ emRWType getRWtype(){
     ibutton.reset(); ibutton.write(0x1D);
     ibutton.write_bit(0);
     delay(10); pinMode(iButtonPin, INPUT);
-    // Видалено Serial.println(F(" Type: dallas RW-1990.2 "));
     return RW1990_2;
   }
   
@@ -572,12 +704,10 @@ emRWType getRWtype(){
   byte m1[3] = {0xAA, 0,0};
   if (OneWire::crc8(m1, 3) == answer) {
     answer = ibutton.read();
-    // Видалено Serial.println(F(" Type: dallas TM2004"));
     ibutton.reset();
     return TM2004;
   }
   ibutton.reset();
-  // Видалено Serial.println(F(" Type: dallas unknown, trying TM-01! "));
   return TM01;
 }
 
@@ -588,25 +718,24 @@ bool write2iBtnTM2004(){
   ibutton.write(0x00); ibutton.write(0x00);
   for (byte i = 0; i<8; i++){
     digitalWrite(R_Led, !digitalRead(R_Led));
-    ibutton.write(currentKey.id[i]);
+    ibutton.write(keyID[i]);
     answer = ibutton.read();
     delayMicroseconds(600); ibutton.write_bit(1); delay(50);
     pinMode(iButtonPin, INPUT);
-    // Видалено Serial.print('*');
     Sd_WriteStep();
-    if (currentKey.id[i] != ibutton.read()) { result = false; break;}
+    if (keyID[i] != ibutton.read()) { result = false; break;}
   } 
   if (!result){
     ibutton.reset();
-    // Видалено Serial.println(F(" Copy error"));
-    OLED_printError(latinText("Copy error"));
+    OLED_printError("Copy error");
+    oled.println("        key");
     Sd_ErrorBeep();
     digitalWrite(R_Led, HIGH);
     return false;    
   }
   ibutton.reset();
-  // Видалено Serial.println(F(" Key copied successfully"));
-  OLED_printError(latinText("Key copied"), false);
+  OLED_printError("Key successfully", false);
+  oled.println("      copied");
   Sd_ReadOK();
   delay(2000);
   digitalWrite(R_Led, HIGH);
@@ -626,12 +755,11 @@ bool write2iBtnRW1990_1_2_TM01(emRWType rwType){
   ibutton.reset(); 
   if (rwType == TM01) ibutton.write(0xC5);
     else ibutton.write(0xD5);
-  if (bitCnt == 36) BurnByteMC(currentKey.id);
+  if (bitCnt == 36) BurnByteMC(keyID);
   else for (byte i = 0; i< (bitCnt >> 3); i++){
     digitalWrite(R_Led, !digitalRead(R_Led));
-    if (rwType == RW1990_1) BurnByte(~currentKey.id[i]);
-      else BurnByte(currentKey.id[i]);
-    // Видалено Serial.print('*');
+    if (rwType == RW1990_1) BurnByte(~keyID[i]);
+      else BurnByte(keyID[i]);
     Sd_WriteStep();
   }
   if (bitCnt == 64) {
@@ -641,13 +769,12 @@ bool write2iBtnRW1990_1_2_TM01(emRWType rwType){
     }
   digitalWrite(R_Led, LOW);       
   if (!dataIsBurningOK(bitCnt)){
-    // Видалено Serial.println(F(" Copy error"));
-    OLED_printError(latinText("Copy error"));
+    OLED_printError("Copy error");
+    oled.println("        key");
     Sd_ErrorBeep();
     digitalWrite(R_Led, HIGH);
     return false;
   }
-  // Видалено Serial.println(F(" Key copied successfully"));
   if ((keyType == keyMetacom)||(keyType == keyCyfral)){
     ibutton.reset();
     if (keyType == keyCyfral) ibutton.write(0xCA);
@@ -655,7 +782,8 @@ bool write2iBtnRW1990_1_2_TM01(emRWType rwType){
     ibutton.write_bit(1);
     delay(10); pinMode(iButtonPin, INPUT);
   }
-  OLED_printError(latinText("Key copied"), false);
+  OLED_printError("Key successfully", false);
+  oled.println("      copied");
   Sd_ReadOK();
   delay(2000);
   digitalWrite(R_Led, HIGH);
@@ -701,8 +829,7 @@ bool dataIsBurningOK(byte bitCnt){
   if (bitCnt == 36) convetr2MC(buff);
   byte Check = 0;
   for (byte i = 0; i < 8; i++){ 
-    if (currentKey.id[i] == buff[i]) Check++;
-    // Видалено Serial.print(buff[i], HEX); Serial.print(":");
+    if (keyID[i] == buff[i]) Check++;
   }
   if (Check != 8) return false;
   return true;
@@ -714,22 +841,18 @@ bool write2iBtn(){
     ibutton.reset_search(); 
     return false;
   }
-  // Видалено Serial.print(F("New key code: "));
   for (byte i = 0; i < 8; i++) {
-    // Видалено Serial.print(addr[i], HEX); Serial.print(":");  
-    if (currentKey.id[i] == addr[i]) Check++;
+    if (keyID[i] == addr[i]) Check++;
   }
   if (Check == 8) {
     digitalWrite(R_Led, LOW); 
-    // Видалено Serial.println(F("same key. No write needed"));
-    OLED_printError(latinText("Same key"));
+    OLED_printError("This is the same key");
     Sd_ErrorBeep();
     digitalWrite(R_Led, HIGH);
     delay(1000);
     return false;
   }
   emRWType rwType = getRWtype();
-  // Видалено Serial.print(F("\n Writing iButton ID: "));
   if (rwType == TM2004) return write2iBtnTM2004();
     else return write2iBtnRW1990_1_2_TM01(rwType);
 }
@@ -740,26 +863,19 @@ bool searchIbutton(){
     return false;
   }  
   for (byte i = 0; i < 8; i++) {
-    // Видалено Serial.print(addr[i], HEX); Serial.print(":");
-    currentKey.id[i] = addr[i];
+    keyID[i] = addr[i];
   }
   if (addr[0] == 0x01) {
     keyType = keyDallas;
     if (getRWtype() == TM2004) keyType = keyTM2004;
     if (OneWire::crc8(addr, 7) != addr[7]) {
-      // Видалено Serial.println(F("CRC error!"));
-      OLED_printError(latinText("CRC error!"));
+      OLED_printError("CRC error!");
       Sd_ErrorBeep();
       digitalWrite(B_Led, HIGH);
       return false;
     }
     return true;
   }
-  // Видалено switch (addr[0]>>4){
-  //   case 1: Serial.println(F(" Type: Maybe cyfral in Dallas")); break;      
-  //   case 2: Serial.println(F(" Type: Maybe metacom in Dallas"));  break;  
-  //   case 3: Serial.println(F(" Type: unknown Dallas family")); break;             
-  // }
   keyType = keyUnknown;
   return true;
 }
@@ -835,11 +951,8 @@ bool searchCyfral(){
     if (addr[i] != buf[i]) return false;
   keyType = keyCyfral;
   for (byte i = 0; i < 8; i++) {
-    // Видалено Serial.print(addr[i], HEX); Serial.print(":");
-    currentKey.id[i] = addr[i];
+    keyID[i] = addr[i];
   }
-  currentKey.name[0] = '\0';
-  // Видалено Serial.println(F(" Type: Cyfral "));
   return true;  
 }
 
@@ -902,11 +1015,8 @@ bool searchMetacom(){
     if (addr[i] != buf[i]) return false; 
   keyType = keyMetacom;
   for (byte i = 0; i < 8; i++) {
-    // Видалено Serial.print(addr[i], HEX); Serial.print(":");
-    currentKey.id[i] = addr[i];
+    keyID[i] = addr[i];
   }
-  currentKey.name[0] = '\0';
-  // Видалено Serial.println(F(" Type: Metacom "));
   return true;  
 }
 
@@ -987,29 +1097,20 @@ void rfidACsetOn(){
 bool searchEM_Marine(bool copyKey = true){
   byte gr = digitalRead(G_Led);
   bool rez = false;
-  rfidACsetOn();
-  delay(6);
+  rfidACsetOn();            // turn on 125kHz generator and comparator
+  delay(6);                // 13 ms for detector transients
   if (!readEM_Marie(addr)) {
-    if (!copyKey) TCCR2A &=0b00111111;
+    if (!copyKey) TCCR2A &=0b00111111;              // Turn off PWM COM2A (pin 11)
     digitalWrite(G_Led, gr);
     return rez;
   }
   rez = true;
   keyType = keyEM_Marine;
   for (byte i = 0; i<8; i++){
-    if (copyKey) currentKey.id[i] = addr[i];
-    // Видалено Serial.print(addr[i], HEX); Serial.print(":");
+    if (copyKey) keyID[i] = addr [i];
   }
   
-  // Видалено Serial.print(F(" ( id "));
-  // Serial.print(rfidData[0]); Serial.print(" key ");
-  // unsigned long keyNum = (unsigned long)rfidData[1]<<24 | (unsigned long)rfidData[2]<<16 | (unsigned long)rfidData[3]<<8 | (unsigned long)rfidData[4];
-  // Serial.print(keyNum);
-  // Serial.println(F(") Type: EM-Marine "));
-  
-  if (copyKey) currentKey.name[0] = '\0';
-  
-  if (!copyKey) TCCR2A &=0b00111111;
+  if (!copyKey) TCCR2A &=0b00111111;              //Turn off PWM COM2A (pin 11)
   digitalWrite(G_Led, gr);
   return rez;
 }
@@ -1017,77 +1118,77 @@ bool searchEM_Marine(bool copyKey = true){
 void TxBitRfid(byte data){
   if (data & 1) delayMicroseconds(54*8); 
     else delayMicroseconds(24*8);
-  rfidGap(19*8);
+  rfidGap(19*8);                       //write gap
 }
 
 void TxByteRfid(byte data){
   for(byte n_bit=0; n_bit<8; n_bit++){
     TxBitRfid(data & 1);
-    data = data >> 1;
+    data = data >> 1;                   // go to next bit
   }
 }
 
 void rfidGap(unsigned int tm){
-  TCCR2A &=0b00111111;
+  TCCR2A &=0b00111111;                //Turn off PWM COM2A 
   delayMicroseconds(tm);
-  TCCR2A |= _BV(COM2A0);
+  TCCR2A |= _BV(COM2A0);              // Turn on PWM COM2A (pin 11)      
 }
 
 bool T5557_blockRead(byte* buf){
   byte ti; byte j = 0, k=0;
-  for (int i = 0; i<33; i++){
+  for (int i = 0; i<33; i++){                           // read start 0 and 32 significant bits
     ti = ttAComp(2000);
-    if (ti == 2) break;
-    if ( ( ti == 1 ) && ( i == 0)) { ti=2; break; }
-    if (i > 0){
+    if (ti == 2)  break;                                //timeout
+    if ( ( ti == 1 ) && ( i == 0)) { ti=2; break; }     // if start 0 not found - error
+    if (i > 0){                                         //starting from 1st bit write to buffer
       if (ti) bitSet(buf[(i-1) >> 3], 7-j);
         else bitClear(buf[(i-1) >> 3], 7-j);
       j++; if (j>7) j=0;
     }
   }
-  if (ti == 2) return false;
+  if (ti == 2) return false;                           //timeout
   return true;
 }
 
 bool sendOpT5557(byte opCode, unsigned long password = 0, byte lockBit = 0, unsigned long data = 0, byte blokAddr = 1){
-  TxBitRfid(opCode >> 1); TxBitRfid(opCode & 1);
+  TxBitRfid(opCode >> 1); TxBitRfid(opCode & 1); // transmit operation code 10
   if (opCode == 0b00) return true;
-  TxBitRfid(lockBit & 1);
+  // password
+  TxBitRfid(lockBit & 1);               // lockbit 0
   if (data != 0){
     for (byte i = 0; i<32; i++) {
       TxBitRfid((data>>(31-i)) & 1);
     }
   }
-  TxBitRfid(blokAddr>>2); TxBitRfid(blokAddr>>1); TxBitRfid(blokAddr & 1);
-  delay(4);
+  TxBitRfid(blokAddr>>2); TxBitRfid(blokAddr>>1); TxBitRfid(blokAddr & 1);      // block address for writing
+  delay(4);                                                                     // wait while data is written
   return true;
 }
 
 bool write2rfidT5557(byte* buf){
   bool result; unsigned long data32;
   delay(6);
-  for (byte k = 0; k<2; k++){
+  for (byte k = 0; k<2; k++){                                       // send key data
     data32 = (unsigned long)buf[0 + (k<<2)]<<24 | (unsigned long)buf[1 + (k<<2)]<<16 | (unsigned long)buf[2 + (k<<2)]<<8 | (unsigned long)buf[3 + (k<<2)];
-    rfidGap(30 * 8);
-    sendOpT5557(0b10, 0, 0, data32, k+1);
-    // Видалено Serial.print('*'); 
+    rfidGap(30 * 8);                                                 //start gap
+    sendOpT5557(0b10, 0, 0, data32, k+1);                            //transmit 32 key bits to block k
     delay(6);
   }
   delay(6);
-  rfidGap(30 * 8);
+  rfidGap(30 * 8);                  //start gap
   sendOpT5557(0b00);
   delay(4);
   result = readEM_Marie(addr);
-  TCCR2A &=0b00111111;
+  TCCR2A &=0b00111111;              //Turn off PWM COM2A (pin 11)
   for (byte i = 0; i < 8; i++)
-    if (addr[i] != buf[i]) { result = false; break; }
+    if (addr[i] != keyID[i]) { result = false; break; }
   if (!result){
-    // Видалено Serial.println(F("Copy error"));
-    OLED_printError(latinText("Copy error"));
+    OLED_printError("Copy error");
+    oled.println("        key");
     Sd_ErrorBeep();
   } else {
-    // Видалено Serial.println(F("Key copied successfully"));
-    OLED_printError(latinText("Key copied"), false);
+    OLED_printError("Key successfully", false);
+    oled.println("      copied");
     Sd_ReadOK();
     delay(2000);
   }
@@ -1097,26 +1198,24 @@ bool write2rfidT5557(byte* buf){
 
 emRWType getRfidRWtype(){
   unsigned long data32, data33; byte buf[4] = {0, 0, 0, 0}; 
-  rfidACsetOn();
-  delay(13);
-  rfidGap(30 * 8);
-  sendOpT5557(0b11, 0, 0, 0, 1);
+  rfidACsetOn();                // turn on 125kHz generator and comparator
+  delay(13);                    //13 ms for detector transients
+  rfidGap(30 * 8);              //start gap
+  sendOpT5557(0b11, 0, 0, 0, 1); //switch to Vendor ID read mode 
   if (!T5557_blockRead(buf)) return rwUnknown; 
   data32 = (unsigned long)buf[0]<<24 | (unsigned long)buf[1]<<16 | (unsigned long)buf[2]<<8 | (unsigned long)buf[3];
   delay(4);
-  rfidGap(20 * 8);
-  data33 = 0b00000000000101001000000001000000 | (rfidUsePWD << 4);
-  sendOpT5557(0b10, 0, 0, data33, 0);
+  rfidGap(20 * 8);          //gap  
+  data33 = 0b00000000000101001000000001000000 | (rfidUsePWD << 4);   //config register 0b00000000000101001000000001000000
+  sendOpT5557(0b10, 0, 0, data33, 0);   //transmit config register
   delay(4);
-  rfidGap(30 * 8);
-  sendOpT5557(0b11, 0, 0, 0, 1);
+  rfidGap(30 * 8);          //start gap
+  sendOpT5557(0b11, 0, 0, 0, 1); //switch to Vendor ID read mode 
   if (!T5557_blockRead(buf)) return rwUnknown; 
   data33 = (unsigned long)buf[0]<<24 | (unsigned long)buf[1]<<16 | (unsigned long)buf[2]<<8 | (unsigned long)buf[3];
-  sendOpT5557(0b00, 0, 0, 0, 0);
+  sendOpT5557(0b00, 0, 0, 0, 0);  // send Reset
   delay(6);
   if (data32 != data33) return rwUnknown;    
-  // Видалено Serial.print(F(" The rfid RW-key is T5557. Vendor ID is "));
-  // Serial.println(data32, HEX);
   return T5557;
 }
 
@@ -1124,28 +1223,27 @@ bool write2rfid(){
   bool Check = true;
   if (searchEM_Marine(false)) {
     for (byte i = 0; i < 8; i++)
-      if (addr[i] != currentKey.id[i]) { Check = false; break; }
-    if (Check) {
+      if (addr[i] != keyID[i]) { Check = false; break; }  // compare code for writing with what's already written in the key.
+    if (Check) {                                          // if codes match, no need to write
       digitalWrite(R_Led, LOW); 
-      // Видалено Serial.println(F(" same key. No write needed."));
-      OLED_printError(latinText("Same key"));
+      OLED_printError("This is the same key");
       Sd_ErrorBeep();
       digitalWrite(R_Led, HIGH);
       delay(1000);
       return false;
     }
   }
-  emRWType rwType = getRfidRWtype();
-  // Видалено if (rwType != rwUnknown) Serial.print(F("\n Burning rfid ID: "));
+  emRWType rwType = getRfidRWtype(); // determine type T5557 (T5577) or EM4305
   switch (rwType){
-    case T5557: return write2rfidT5557(currentKey.id); break;
+    case T5557: return write2rfidT5557(keyID); break;                    //write T5557
+    //case EM4305: return write2rfidEM4305(keyID); break;                  //write EM4305
     case rwUnknown: break;
   }
   return false;
 }
 
 void SendEM_Marine(byte* buf){ 
-  TCCR2A &=0b00111111;
+  TCCR2A &=0b00111111; // disable pwm 
   digitalWrite(FreqGen, LOW);
   delay(20);
   for (byte k = 0; k<10; k++){
@@ -1168,45 +1266,8 @@ void SendEM_Marine(byte* buf){
 }
 
 void SendDallas(byte* buf){
-  startDallasEmulation(buf);
-  
-  // Триваємо в режимі емуляції поки активний BlueMode
-  unsigned long lastHubPoll = 0;
-  
-  while (copierMode == md_blueMode && emulationActive) {
-    if (millis() - lastHubPoll > 1) {
-      hub.poll();
-      lastHubPoll = millis();
-    }
-    
-    // Перевіряємо кнопку MODE для виходу
-    if (digitalRead(BTN_MODE) == LOW) {
-      delay(50);
-      if (digitalRead(BTN_MODE) == LOW) {
-        stopDallasEmulation();
-        copierMode = md_read;
-        clearLed();
-        digitalWrite(G_Led, HIGH);
-        OLED_printKey(currentKey.id);
-        Sd_WriteStep();
-        break;
-      }
-    }
-    
-    // Блимаємо синім світлодіодом
-    digitalWrite(B_Led, (millis() / 500) % 2);
-    
-    delay(1);
-  }
-  
-  // Якщо вийшли через таймаут
-  if (emulationActive) {
-    stopDallasEmulation();
-    copierMode = md_read;
-    clearLed();
-    digitalWrite(G_Led, HIGH);
-    OLED_printKey(currentKey.id);
-  }
+  // Dallas emulation code
+  // Need to implement
 }
 
 void BM_SendKey(byte* buf){
@@ -1216,251 +1277,188 @@ void BM_SendKey(byte* buf){
   }
 }
 
-void clearLed(){
-  digitalWrite(R_Led, LOW);
-  digitalWrite(G_Led, LOW);
-  digitalWrite(B_Led, LOW);  
-}
-
-void timerIsr() {
-  // Таймер використовується для інших цілей
-}
-
-// ==================== SETUP ====================
-void setup() {
-  pinMode(Luse_Led, OUTPUT); digitalWrite(Luse_Led, HIGH);
-  
-  pinMode(BTN_MODE, INPUT_PULLUP);
-  pinMode(BTN_LEFT, INPUT_PULLUP);
-  pinMode(BTN_RIGHT, INPUT_PULLUP);
-  
-  oled.init();
-  oled.setScale(1);
-  pinMode(speakerPin, OUTPUT);
-  pinMode(ACpin, INPUT);
-  pinMode(R_Led, OUTPUT); pinMode(G_Led, OUTPUT); pinMode(B_Led, OUTPUT);
-  clearLed();
-  pinMode(FreqGen, OUTPUT);                               
-  Serial.begin(115200);  // Поки залишаємо для команд 's' та 'e'
-  
-  oled.clear();
-  oled.home();
-  oled.println(latinText("MultiKey------Rfid"));
-  oled.println          ("-----------iButton");
-  oled.println          ("------------------");
-  oled.println          ("Read Write Emulate");
-  oled.update();
-  
-  Sd_StartOK();
-  
-  EEPROM_key_count = EEPROM[0];
-  if (EEPROM_key_count > maxKeyCount) EEPROM_key_count = 0;
-  
-  if (EEPROM_key_count != 0 ) {
-    EEPROM_key_index = EEPROM[1];
-    if (EEPROM_key_index > EEPROM_key_count || EEPROM_key_index == 0) EEPROM_key_index = 1;
-    
-    // Видалено Serial.print(F("Key from ROM: "));
-    EEPROM_get_key(EEPROM_key_index, currentKey.id);
-    // for (byte i = 0; i < 8; i++) {
-    //   Serial.print(currentKey.id[i], HEX); Serial.print(F(":"));  
-    // }
-    // Serial.println();
-    delay(3000);
-    OLED_printKey(currentKey.id);
-    copierMode = md_read;
-    digitalWrite(G_Led, HIGH);
-  } else {
-    oled.clear();
-    oled.home();
-    oled.println(latinText("No keys in ROM"));
-    oled.update();  
-  }
-
-  Timer1.initialize(1000);
-  Timer1.attachInterrupt(timerIsr);
-  digitalWrite(Luse_Led, !digitalRead(Luse_Led));
-  
-  // Додавання 6 універсальних ключів з назвами
-  KeyData newKey;
-  
-  for (int i = 0; i < 6; i++) {
-    memcpy(newKey.id, ReadID[i], 8);
-    strcpy(newKey.name, keyNames[i]);
-    
-    if (EPPROM_AddKey(newKey)) {
-      OLED_printError(latinText("Uni key added"), false);
-      Sd_ReadOK();
-      delay(300);
-    }
-  }
-}
-
-// ==================== LOOP ====================
 unsigned long stTimer = millis();
 
 void loop() {
   char echo = Serial.read();
   
-  if (echo == 's') {
-    Serial.print(F("RFID Mode: "));
-    Serial.println(copierMode == md_read ? "Read" : 
-                   copierMode == md_write ? "Write" :
-                   copierMode == md_blueMode ? "BlueMode" : "Off");
-    
-    Serial.print(F("A0 value: "));
-    int val = analogRead(A0);
-    Serial.print(val);
-    Serial.print(" (");
-    Serial.print(val * (5.0 / 1023.0), 2);
-    Serial.println("V)");
-  }
-  
+  // Only e command for memory clearing remains
   if (echo == 'e'){
     oled.clear();
     oled.home();
-    oled.println(latinText("ROM cleared!"));
-    Serial.println(F("EEPROM cleared"));
+    oled.println("Memory cleared successfully!");
     EEPROM.update(0, 0); EEPROM.update(1, 0);
     EEPROM_key_count = 0; EEPROM_key_index = 0;
     Sd_ReadOK();
     oled.update();
   }
   
-  bool modeReading = digitalRead(BTN_MODE);
-  bool leftReading = digitalRead(BTN_LEFT);
-  bool rightReading = digitalRead(BTN_RIGHT);
+  // Reading buttons
+  bool modeBtn = readButton(BTN_MODE, 0);
+  bool leftBtn = readButton(BTN_LEFT, 1);
+  bool rightBtn = readButton(BTN_RIGHT, 2);
   
-  // Обробка кнопки MODE
-  if (modeReading == LOW && !modeButtonPressed) {
-    delay(debounceDelay);
-    if (digitalRead(BTN_MODE) == LOW) {
-      modeButtonPressed = true;
-      
-      if (emulationActive) {
-        stopDallasEmulation();
+  // ===== MODE PROCESSING =====
+  if (!emulating) {
+    // Normal mode (not emulation)
+    
+    // ===== MODE + LEFT COMBINATION PROCESSING (DELETION) =====
+    if (modeBtn == LOW && leftBtn == LOW) {
+      if (!comboMode) {
+        comboTimeStart = millis();
+        comboMode = true;
+        Sd_ComboStart(); // Sound signal for combination start
+      } else if (millis() - comboTimeStart > 1000) { // Hold for 1 second
+        if (digitalRead(BTN_MODE) == LOW && digitalRead(BTN_LEFT) == LOW) {
+          deleteCurrentKey();
+          while (digitalRead(BTN_MODE) == LOW || digitalRead(BTN_LEFT) == LOW); // Wait for release
+        }
+        comboMode = false;
       }
-      
-      // Коротке натискання - перемикання режиму
-      if (millis() - holdTimeStart < 1000) {
+    } else {
+      comboMode = false;
+    }
+    
+    // MODE button processing (mode switching) - only if not in combination
+    static bool lastModeBtnState = HIGH;
+    if (modeBtn == LOW && lastModeBtnState == HIGH && !comboMode) {
+      delay(50); // additional debounce
+      if (digitalRead(BTN_MODE) == LOW && !comboMode) {
         switch (copierMode){
           case md_empty: Sd_ErrorBeep(); break;
-          case md_read: copierMode = md_write; clearLed(); digitalWrite(R_Led, HIGH);  break;
-          case md_write: copierMode = md_blueMode; clearLed(); digitalWrite(B_Led, HIGH); 
-            digitalWrite(Luse_Led, !digitalRead(Luse_Led)); break;
-          case md_blueMode: copierMode = md_read; clearLed(); digitalWrite(G_Led, HIGH); 
-            digitalWrite(Luse_Led, !digitalRead(Luse_Led)); break;
+          case md_read: 
+            copierMode = md_write; 
+            clearLed(); 
+            digitalWrite(R_Led, HIGH);  
+            break;
+          case md_write: 
+            copierMode = md_blueMode; 
+            clearLed(); 
+            // In md_blueMode start appropriate emulation
+            if (keyType == keyEM_Marine) {
+              startRFIDEmulation();
+            } else {
+              startIButtonEmulation();
+            }
+            break;
+          case md_blueMode: 
+            copierMode = md_read; 
+            clearLed(); 
+            digitalWrite(G_Led, HIGH); 
+            break;
         }
-        OLED_printKey(currentKey.id);
-        // Видалено Serial.print(F("Mode: ")); Serial.println(copierMode);
+        if (copierMode != md_blueMode) {
+          OLED_printKey(keyID);
+          Sd_WriteStep();
+        }
+      }
+    }
+    lastModeBtnState = modeBtn;
+    
+    // LEFT button processing (previous key) - only if not in combination
+    static bool lastLeftBtnState = HIGH;
+    if (leftBtn == LOW && lastLeftBtnState == HIGH && EEPROM_key_count > 0 && copierMode != md_blueMode && !comboMode) {
+      delay(50);
+      if (digitalRead(BTN_LEFT) == LOW && !comboMode) {
+        EEPROM_key_index--;
+        if (EEPROM_key_index < 1) EEPROM_key_index = EEPROM_key_count;
+        EEPROM_get_key(EEPROM_key_index, keyID);
+        OLED_printKey(keyID);
         Sd_WriteStep();
       }
     }
-  }
-  
-  // Обробка кнопки LEFT
-  if (leftReading == LOW && !leftButtonPressed && EEPROM_key_count > 0 && !emulationActive) {
-    delay(debounceDelay);
-    if (digitalRead(BTN_LEFT) == LOW) {
-      leftButtonPressed = true;
-      EEPROM_key_index--;
-      if (EEPROM_key_index < 1) EEPROM_key_index = EEPROM_key_count;
-      EEPROM_get_key(EEPROM_key_index, currentKey.id);
-      OLED_printKey(currentKey.id);
-      Sd_WriteStep();
-    }
-  }
-  
-  // Обробка кнопки RIGHT
-  if (rightReading == LOW && !rightButtonPressed && EEPROM_key_count > 0 && !emulationActive) {
-    delay(debounceDelay);
-    if (digitalRead(BTN_RIGHT) == LOW) {
-      rightButtonPressed = true;
-      EEPROM_key_index++;
-      if (EEPROM_key_index > EEPROM_key_count) EEPROM_key_index = 1;
-      EEPROM_get_key(EEPROM_key_index, currentKey.id);
-      OLED_printKey(currentKey.id);
-      Sd_WriteStep();
-    }
-  }
-  
-  if (modeReading == HIGH && modeButtonPressed) modeButtonPressed = false;
-  if (leftReading == HIGH && leftButtonPressed) leftButtonPressed = false;
-  if (rightReading == HIGH && rightButtonPressed) rightButtonPressed = false;
-  
-  // Обробка утримання кнопки MODE
-  if (modeReading == LOW && !emulationActive) {
-    if (!holdMode) {
-      holdTimeStart = millis();
-      holdMode = true;
-    } else if (millis() - holdTimeStart > 1000) {
-      if (digitalRead(BTN_MODE) == LOW) {
-        if (copierMode == md_read) {
-          // В режимі читання - збереження ключа
-          KeyData newKey;
-          memcpy(newKey.id, currentKey.id, 8);
-          String nameStr = getKeyName(currentKey.id);
-          strcpy(newKey.name, nameStr.c_str());
-          
-          if (EPPROM_AddKey(newKey)) {
-            OLED_printError(latinText("Key saved"), false);
-            Sd_ReadOK();
-          } else {
-            OLED_printError(latinText("Key exists"));
-            Sd_ErrorBeep();
-          }
-        } 
-        else if (copierMode == md_write) {
-          // В режимі запису - видалення ключа
-          if (EEPROM_key_count > 0) {
-            // Показуємо повідомлення про видалення
-            oled.clear();
-            oled.home();
-            oled.println("Hold to DELETE");
-            oled.println(String(EEPROM_key_index) + "/" + String(EEPROM_key_count));
-            oled.println("Release to cancel");
-            oled.update();
-            
-            delay(500); // Коротка пауза для читання повідомлення
-            
-            // Викликаємо функцію видалення з підтвердженням
-            deleteCurrentKey();
-          }
-        }
-        
-        OLED_printKey(currentKey.id);
-        holdMode = false;
+    lastLeftBtnState = leftBtn;
+    
+    // RIGHT button processing (next key)
+    static bool lastRightBtnState = HIGH;
+    if (rightBtn == LOW && lastRightBtnState == HIGH && EEPROM_key_count > 0 && copierMode != md_blueMode && !comboMode) {
+      delay(50);
+      if (digitalRead(BTN_RIGHT) == LOW) {
+        EEPROM_key_index++;
+        if (EEPROM_key_index > EEPROM_key_count) EEPROM_key_index = 1;
+        EEPROM_get_key(EEPROM_key_index, keyID);
+        OLED_printKey(keyID);
+        Sd_WriteStep();
       }
     }
-  } else {
-    holdMode = false;
-  }
-  
-  if (millis() - stTimer < 100) return;
-  stTimer = millis();
-  
-  switch (copierMode){
-      case md_empty: case md_read: 
-        if (!emulationActive && (searchCyfral() || searchMetacom() || searchEM_Marine() || searchIbutton() )){
+    lastRightBtnState = rightBtn;
+    
+    // MODE button hold processing (key saving) - only if not in combination
+    if (copierMode != md_empty && modeBtn == LOW && copierMode != md_blueMode && !comboMode) {
+      if (!holdMode) {
+        holdTimeStart = millis();
+        holdMode = true;
+      } else if (millis() - holdTimeStart > 1000) { // Hold for 1 second
+        if (digitalRead(BTN_MODE) == LOW && !comboMode) {
+          if (EPPROM_AddKey(keyID)) {
+            OLED_printError("Key saved", false);
+            Sd_ReadOK();
+            delay(1000); 
+          } else {
+            Sd_ErrorBeep();
+          }
+          OLED_printKey(keyID);
+          while (digitalRead(BTN_MODE) == LOW); // Wait for release
+        }
+        holdMode = false;
+      }
+    } else {
+      holdMode = false;
+    }
+    
+    // Delay for stable operation
+    if (millis() - stTimer < 100) return;
+    stTimer = millis();
+    
+    // Main operation cycle depending on mode
+    switch (copierMode){
+      case md_empty: 
+      case md_read: 
+        if (searchCyfral() || searchMetacom() || searchEM_Marine() || searchIbutton() ) {
           Sd_ReadOK();
           copierMode = md_read;
           digitalWrite(G_Led, HIGH);
-          if (indxKeyInROM(currentKey.id) == 0) OLED_printKey(currentKey.id, 1);
-            else OLED_printKey(currentKey.id, 3);
-          } 
+          if (indxKeyInROM(keyID) == 0) OLED_printKey(keyID, 1);
+            else OLED_printKey(keyID, 3);
+        } 
         break;
       case md_write:
-        if (!emulationActive) {
-          if (keyType == keyEM_Marine) write2rfid();
-            else write2iBtn(); 
-        }
+        if (keyType == keyEM_Marine) write2rfid();
+          else write2iBtn(); 
         break;
-      case md_blueMode: 
-        if (!emulationActive) {
-          OLED_printKey(currentKey.id, 4);
-          BM_SendKey(currentKey.id);
-        }
+      case md_blueMode:
+        // Already processed in emulation mode
         break;
     }
+  } else {
+    // ===== EMULATION MODE =====
+    
+    // MODE button - stop emulation
+    static bool lastModeBtnState = HIGH;
+    if (modeBtn == LOW && lastModeBtnState == HIGH) {
+      delay(50);
+      if (digitalRead(BTN_MODE) == LOW) {
+        stopEmulation();
+        copierMode = md_read;
+        clearLed();
+        digitalWrite(G_Led, HIGH);
+        while (digitalRead(BTN_MODE) == LOW);
+      }
+    }
+    lastModeBtnState = modeBtn;
+    
+    // Continue emulation depending on key type
+    if (keyType == keyEM_Marine) {
+      // For RFID - constantly send key
+      sendRFIDKey(keyID);
+    } else {
+      // For iButton - process requests
+      hub.poll();
+    }
+    
+    // Blink blue LED
+    digitalWrite(B_Led, (millis() / 500) % 2);
+  }
+  
+  delay(1);
 }
-
